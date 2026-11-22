@@ -1,0 +1,10 @@
+aws_region          = "us-gov-west-1"
+expected_partition  = "aws-us-gov"
+allowed_account_ids = ["123456789012"]
+environment         = "dev"
+github_repository   = "your-github-user/devsecops-eks-demo"
+single_nat_gateway  = true
+# Commercial-region demo instead of GovCloud:
+# aws_region         = "us-east-1"
+# azs                = ["us-east-1a", "us-east-1b", "us-east-1c"]
+# expected_partition = "aws"
