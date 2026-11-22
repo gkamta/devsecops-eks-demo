@@ -127,6 +127,17 @@ Then in GitHub: set the repository variables `AWS_CI_ROLE_ARN` (from `terraform 
 
 ---
 
+## A real catch from the Trivy gate
+
+The first build of this repo **failed the Trivy gate**, which is the gate doing its job. The initial
+dependency pins had fixable HIGH/CRITICAL CVEs, including PyJWT authentication-bypass advisories, a
+Starlette DoS, and a Debian 12 `libexpat` issue in the base image. The fix bumped FastAPI, Uvicorn,
+and PyJWT and moved the runtime to `distroless/python3-debian13`. The gate now reports
+**0 fixable HIGH/CRITICAL**, and the remaining unfixed upstream findings go to the Security tab via
+SARIF for tracking (POA&M-style through `.trivyignore` with expiry dates).
+
+---
+
 ## Repository layout
 
 ```

@@ -7,7 +7,7 @@
 # pin by digest (@sha256:...). Iron Bank (registry1.dso.mil) images are the
 # DoD-hardened equivalent.
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim-bookworm AS builder
+FROM python:3.13-slim-trixie AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -22,9 +22,9 @@ RUN python -m compileall -q /deps /build/app \
 
 # ---------------------------------------------------------------------------
 # Stage 2: distroless runtime. No shell, no package manager, runs as the
-# built-in non-root user (uid 65532). Python 3.11 matches the builder.
+# built-in non-root user (uid 65532). Python 3.13 matches the builder.
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/python3-debian12:nonroot AS runtime
+FROM gcr.io/distroless/python3-debian13:nonroot AS runtime
 
 LABEL org.opencontainers.image.title="mission-api" \
       org.opencontainers.image.description="FastAPI service protected by Keycloak OIDC" \
