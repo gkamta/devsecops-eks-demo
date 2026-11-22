@@ -1,0 +1,109 @@
+{
+  "realm": "devsecops",
+  "displayName": "DevSecOps Demo",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "bruteForceProtected": true,
+  "failureFactor": 5,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 900,
+  "passwordPolicy": "length(12) and upperCase(1) and lowerCase(1) and digits(1) and specialChars(1)",
+  "roles": {
+    "realm": [
+      {
+        "name": "mission-reader",
+        "description": "Read access to the Mission API"
+      },
+      {
+        "name": "mission-admin",
+        "description": "Administrative access to the Mission API"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "mission-api",
+      "name": "Mission API (resource server)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false
+    },
+    {
+      "clientId": "mission-cli",
+      "name": "Mission CLI / SPA (public, PKCE)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8000/*"
+      ],
+      "webOrigins": [
+        "http://localhost:8000"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "audience-mission-api",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "mission-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ],
+      "implicitFlowEnabled": false
+    }
+  ],
+  "users": [
+    {
+      "username": "analyst1",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Mission",
+      "lastName": "Analyst",
+      "email": "analyst1@example.mil",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Analyst#Demo2026",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "mission-reader"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "guest1",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Guest",
+      "lastName": "User",
+      "email": "guest1@example.mil",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Guest#Demo2026",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [],
+      "requiredActions": []
+    }
+  ]
+}

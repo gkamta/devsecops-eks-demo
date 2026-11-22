@@ -1,0 +1,49 @@
+# Local developer stack: Mission API + Keycloak (dev mode, realm auto-imported).
+#   docker compose up --build
+#   make token && make call
+# NOT for production: Keycloak runs in dev mode with an in-memory H2 DB.
+name: devsecops-eks-demo
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm", "--health-enabled=true"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin   # local dev only
+      # Pin the issuer so tokens minted from the host and validated in-network agree.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      # Keycloak image has bash but no curl; probe the management port via /dev/tcp.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  api:
+    build: .
+    image: mission-api:local
+    environment:
+      APP_ENV: local
+      OIDC_ISSUER: http://localhost:8080/realms/devsecops
+      # Back-channel: fetch signing keys over the compose network.
+      OIDC_JWKS_URL: http://keycloak:8080/realms/devsecops/protocol/openid-connect/certs
+      OIDC_AUDIENCE: mission-api
+      REQUIRED_ROLE: mission-reader
+    ports:
+      - "8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      keycloak:
+        condition: service_healthy
