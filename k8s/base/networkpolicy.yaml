@@ -1,0 +1,57 @@
+# Default deny everything in the namespace, then allow only what's required (SC-7, AC-4).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: mission-api
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mission-api-allow
+  namespace: mission-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mission-api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Only the ingress controller namespace may reach the API.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Keycloak JWKS (in-cluster) and AWS STS/VPC endpoints over TLS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: keycloak
+      ports:
+        - protocol: TCP
+          port: 8443
+    - to:
+        - ipBlock:
+            cidr: 10.40.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

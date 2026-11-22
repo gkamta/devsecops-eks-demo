@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mission-api
+  namespace: mission-api
+data:
+  APP_ENV: base
+  OIDC_ISSUER: https://keycloak.example.mil/realms/devsecops
+  OIDC_AUDIENCE: mission-api
+  REQUIRED_ROLE: mission-reader
