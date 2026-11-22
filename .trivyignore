@@ -1,0 +1,4 @@
+# Risk-accepted findings. Every entry needs: CVE, justification, POA&M / ticket, expiry.
+# Trivy honors `exp:` so accepted risks automatically fail the build again after expiry.
+# Example:
+# CVE-2099-00000 exp:2027-01-31  # not reachable: affects optional extra we don't install; POAM-123

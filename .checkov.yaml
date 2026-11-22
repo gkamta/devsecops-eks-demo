@@ -1,0 +1,13 @@
+# Checkov config used locally (make scan) and in CI.
+framework:
+  - terraform
+  - kubernetes
+  - kustomize
+  - dockerfile
+  - github_actions
+  - secrets
+skip-path:
+  - .terraform
+compact: true
+quiet: true
+# Inline skips (# checkov:skip=... / checkov.io/skipN annotations) each carry a written justification.

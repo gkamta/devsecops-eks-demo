@@ -1,0 +1,351 @@
+# DevSecOps pipeline for mission-api.
+#
+#   PR / push ─┬─ lint-test ───────┐
+#              ├─ secret-scan ─────┤
+#              ├─ sast ────────────┼─ build-scan ── (main) publish: push, SBOM, cosign sign/attest
+#              ├─ iac-scan ────────┤                             │
+#              └─ terraform ───────┘                             ▼
+#                  └─ plan (only if AWS OIDC role configured)    deploy-dev ─▶ deploy-stage ─▶ deploy-prod
+#                                                                (GitHub Environments gate each step)
+#
+# All third-party actions are pinned to full commit SHAs (supply-chain hardening;
+# Dependabot keeps them current). AWS auth is keyless via GitHub OIDC.
+name: devsecops-pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: mission-api
+  PYTHON_VERSION: "3.11"
+  TF_VERSION: "1.9.8"
+  TF_DIR: terraform/environments/dev
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-gov-west-1' }}
+
+jobs:
+  # ---------------------------------------------------------------- 1. lint + unit tests
+  lint-test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r app/requirements-dev.txt
+      - name: Ruff lint
+        run: ruff check app
+      - name: Pytest with coverage
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=85 --junitxml=pytest-report.xml
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            coverage.xml
+            pytest-report.xml
+
+  # ---------------------------------------------------------------- 2. secret scanning
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # scan full history, not just the tip
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  # ---------------------------------------------------------------- 3. SAST
+  sast:
+    name: SAST (bandit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "bandit[sarif]==1.7.10"
+      - name: Bandit (fail on medium+ severity)
+        run: |
+          bandit -c pyproject.toml -r app -f sarif -o bandit.sarif --exit-zero
+          bandit -c pyproject.toml -r app --severity-level medium --confidence-level medium
+      - uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+  # ---------------------------------------------------------------- 4. IaC scanning
+  iac-scan:
+    name: IaC scan (checkov + tflint)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkov (Terraform, Kubernetes, Kustomize, Dockerfile, GitHub Actions)
+        uses: bridgecrewio/checkov-action@b17b606d6ec72bb8ba5721ad5b7e340b80a9fc39 # v12.3142.0
+        with:
+          directory: .
+          config_file: .checkov.yaml
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+      - uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: v0.53.0
+      - name: TFLint
+        working-directory: terraform
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when downloading the AWS ruleset
+        run: |
+          tflint --init --config="$PWD/.tflint.hcl"
+          tflint --recursive --config="$PWD/.tflint.hcl" --format=compact
+
+  # ---------------------------------------------------------------- 5. Terraform fmt / validate / plan
+  terraform:
+    name: Terraform fmt / validate / plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC -> AWS STS
+      pull-requests: write
+    env:
+      HAS_AWS: ${{ vars.AWS_CI_ROLE_ARN != '' && vars.TF_STATE_BUCKET != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - name: terraform fmt
+        run: terraform fmt -recursive -check -diff terraform
+      - name: terraform validate (all roots, no backend)
+        run: |
+          for dir in terraform/environments/dev terraform/bootstrap; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+      - name: Skip notice
+        if: env.HAS_AWS != 'true'
+        run: echo "::notice::terraform plan skipped - set repo variables AWS_CI_ROLE_ARN and TF_STATE_BUCKET to enable."
+      - name: Configure AWS credentials (OIDC, no static keys)
+        if: env.HAS_AWS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          role-session-name: gha-plan-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: terraform plan
+        if: env.HAS_AWS == 'true'
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=devsecops-eks-demo/dev/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE || 'terraform-state-lock' }}" \
+            -backend-config="encrypt=true"
+          terraform plan -input=false -no-color -out=tfplan \
+            -var="aws_region=${AWS_REGION}" \
+            -var="github_repository=${{ github.repository }}" | tee plan.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.HAS_AWS == 'true'
+        with:
+          name: tfplan
+          path: ${{ env.TF_DIR }}/plan.txt
+          retention-days: 30
+
+  # ---------------------------------------------------------------- 6. container build + Trivy
+  build-scan:
+    name: Build image & Trivy scan
+    runs-on: ubuntu-latest
+    needs: [lint-test, secret-scan, sast, iac-scan, terraform]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build (load locally for scanning)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+      - name: Trivy vulnerability scan (SARIF for Security tab)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+      - uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+      - name: Trivy gate - fail on fixable HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          exit-code: "1"
+
+  # ---------------------------------------------------------------- 7. publish: push, SBOM, sign (main only)
+  publish:
+    name: Push, SBOM (syft) & sign (cosign keyless)
+    runs-on: ubuntu-latest
+    needs: build-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # Sigstore keyless signing + AWS OIDC
+    env:
+      HAS_AWS: ${{ vars.AWS_CI_ROLE_ARN != '' }}
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      ecr_repo: ${{ steps.refs.outputs.ecr_repo }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure AWS credentials (OIDC)
+        if: env.HAS_AWS == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          role-session-name: gha-publish-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Log in to ECR
+        if: env.HAS_AWS == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+      - name: Compute image refs
+        id: refs
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          ghcr="ghcr.io/${owner}/${IMAGE_NAME}"
+          tags="${ghcr}:${GITHUB_SHA}"
+          echo "ghcr_repo=${ghcr}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_AWS}" = "true" ]; then
+            ecr="${{ steps.ecr.outputs.registry }}/${IMAGE_NAME}"
+            tags="${tags},${ecr}:${GITHUB_SHA}"   # ECR repo is tag-immutable: SHA tags only
+            echo "ecr_repo=${ecr}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+      - name: Build & push (same digest to every registry)
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.refs.outputs.tags }}
+          cache-from: type=gha
+          provenance: mode=max
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+      - name: Generate SBOM (syft, SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.refs.outputs.ghcr_repo }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+      - name: Sign image and attach SBOM attestation (keyless, Fulcio + Rekor)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          GHCR: ${{ steps.refs.outputs.ghcr_repo }}
+          ECR: ${{ steps.refs.outputs.ecr_repo }}
+        run: |
+          for repo in "$GHCR" ${ECR:+"$ECR"}; do
+            cosign sign --yes "${repo}@${DIGEST}"
+            cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${repo}@${DIGEST}"
+          done
+      - name: Summary
+        run: |
+          {
+            echo "### Published image"
+            echo "- GHCR: \`${{ steps.refs.outputs.ghcr_repo }}@${{ steps.push.outputs.digest }}\`"
+            [ -n "${{ steps.refs.outputs.ecr_repo }}" ] && echo "- ECR: \`${{ steps.refs.outputs.ecr_repo }}@${{ steps.push.outputs.digest }}\`"
+            echo "- Signed with cosign keyless; SBOM attested (SPDX)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- 8. gated deploys to EKS
+  deploy-dev:
+    name: Deploy → dev
+    needs: publish
+    if: needs.publish.outputs.ecr_repo != ''
+    uses: ./.github/workflows/deploy-eks.yml
+    with:
+      environment: dev
+      image_repo: ${{ needs.publish.outputs.ecr_repo }}
+      image_digest: ${{ needs.publish.outputs.digest }}
+    permissions:
+      contents: read
+      id-token: write
+
+  deploy-stage:
+    name: Deploy → stage
+    needs: [publish, deploy-dev]
+    uses: ./.github/workflows/deploy-eks.yml
+    with:
+      environment: stage
+      image_repo: ${{ needs.publish.outputs.ecr_repo }}
+      image_digest: ${{ needs.publish.outputs.digest }}
+    permissions:
+      contents: read
+      id-token: write
+
+  deploy-prod:
+    name: Deploy → prod
+    needs: [publish, deploy-stage]
+    uses: ./.github/workflows/deploy-eks.yml
+    with:
+      environment: prod
+      image_repo: ${{ needs.publish.outputs.ecr_repo }}
+      image_digest: ${{ needs.publish.outputs.digest }}
+    permissions:
+      contents: read
+      id-token: write
