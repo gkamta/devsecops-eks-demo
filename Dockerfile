@@ -7,7 +7,7 @@
 # pin by digest (@sha256:...). Iron Bank (registry1.dso.mil) images are the
 # DoD-hardened equivalent.
 # ---------------------------------------------------------------------------
-FROM python:3.13-slim-trixie AS builder
+FROM python:3.15-slim-trixie AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
